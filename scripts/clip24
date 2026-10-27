@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Clipboard history (text and images) for the Omarchy shell.
+
+  clip24 capture text|image      stdin = clipboard data (run by wl-paste --watch)
+  clip24 list                    every entry as a JSON array, newest first
+  clip24 panel                   short previews, counts and settings for the bar panel
+  clip24 copy <id>               put an entry back on the clipboard
+  clip24 type <id>               type a text entry into the focused window (wtype)
+  clip24 pin <id> [on|off]       pinned entries never expire (toggles without on|off)
+  clip24 delete <id>
+  clip24 clear [--all]           delete everything except pinned entries (--all: those too)
+  clip24 prune                   drop expired entries now
+  clip24 config                  print the settings in effect
+  clip24 edit                    create the settings file if missing and open it
+
+Entries live in ~/.local/state/omarchy/clip24/ (history.json plus images/).
+Settings: ~/.config/omarchy/cliphistory.json (see DEFAULTS); this script only
+writes that file when `edit` creates it. Copies marked sensitive (wl-copy
+--sensitive, KeePassXC and other password managers) are never stored.
+
+Environment: CLIPHISTORY_DIR and CLIPHISTORY_CONFIG override the two paths,
+OMARCHY_NO_NOTIFY=1 prints notifications instead of sending them.
+"""
+import fcntl, fnmatch, hashlib, json, os, re, struct, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
+DIR = os.environ.get("CLIPHISTORY_DIR") or os.path.join(STATE, "omarchy/clip24")
+DB = os.path.join(DIR, "history.json")
+IMAGES = os.path.join(DIR, "images")
+CONF = os.environ.get("CLIPHISTORY_CONFIG") or os.path.join(HOME, ".config/omarchy/cliphistory.json")
+
+DEFAULTS = {
+    "retentionHours": 24,   # unpinned entries older than this are deleted
+    "maxItems": 500,        # newest unpinned entries kept; pinned ones don't count
+    "images": True,         # record copied images
+    "maxImageMB": 10,       # larger images are skipped
+    "maxTextKB": 512,       # larger text is skipped (never stored cut off)
+    # Window classes (glob, case-insensitive) whose copies are never stored.
+    "ignoreApps": ["*keepassxc*", "*bitwarden*", "*1password*", "*proton*pass*",
+                   "*enpass*", "org.gnome.World.Secrets"],
+}
+LIMITS = {"retentionHours": (1, 24 * 365), "maxItems": (10, 5000), "maxImageMB": (1, 200), "maxTextKB": (1, 16384)}
+
+# MIME types a source offers to say "don't keep this" (KDE's password-manager
+# hint is what wl-copy --sensitive and KeePassXC use).
+SENSITIVE_TYPES = {"x-kde-passwordManagerHint", "application/x-nspasteboard-concealed-type"}
+PLAIN_TEXT_TYPES = {"text/plain", "text/plain;charset=utf-8", "UTF8_STRING", "STRING", "TEXT"}
+TMP_PREFIX = ".incoming-"
+
+
+# ---------------------------------------------------------------- settings
+
+def settings():
+    s = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            s.update({k: v for k, v in user.items() if k in DEFAULTS})
+    except (OSError, ValueError):
+        pass
+    for key, (lo, hi) in LIMITS.items():
+        try:
+            s[key] = max(lo, min(hi, int(s[key])))
+        except (TypeError, ValueError):
+            s[key] = DEFAULTS[key]
+    s["images"] = s["images"] is not False
+    if not isinstance(s["ignoreApps"], list):
+        s["ignoreApps"] = DEFAULTS["ignoreApps"]
+    s["ignoreApps"] = [str(p) for p in s["ignoreApps"] if str(p).strip()]
+    return s
+
+
+def notify(title, body):
+    if os.environ.get("OMARCHY_NO_NOTIFY") == "1":
+        print(f"notify: {title} — {body}", file=sys.stderr)
+        return
+    try:
+        subprocess.Popen(["omarchy-notification-send", "-g", "\U000f18f9", title, body],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- storage
+
+def ensure_dirs():
+    for d in (DIR, IMAGES):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        # Version 1 created these world-readable; keep them private.
+        if os.stat(d).st_mode & 0o077:
+            os.chmod(d, 0o700)
+
+
+def create_temp(directory, prefix, suffix=""):
+    """A new private file with a unique name (tempfile costs a lot of imports
+    for something that runs on every copy)."""
+    while True:
+        path = os.path.join(directory, f"{prefix}{os.getpid()}-{os.urandom(4).hex()}{suffix}")
+        try:
+            return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), path
+        except FileExistsError:
+            continue
+
+
+def load():
+    try:
+        with open(DB) as f:
+            items = json.load(f)
+        return [i for i in items if isinstance(i, dict) and i.get("id")] if isinstance(items, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save(items):
+    """Atomic: write a temp file next to history.json, then rename over it."""
+    ensure_dirs()
+    fd, tmp = create_temp(DIR, ".history-", ".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(items, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, DB)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Locked:
+    """Exclusive flock on <dir>/.lock around every read-modify-write."""
+
+    def __enter__(self):
+        ensure_dirs()
+        self.f = open(os.path.join(DIR, ".lock"), "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
+def prune(items, s, now=None):
+    """Drop expired and surplus entries (pinned ones stay), entries whose image
+    file is gone, and image files nothing refers to any more."""
+    now = time.time() if now is None else now
+    cutoff = now - s["retentionHours"] * 3600
+    items = sorted(items, key=lambda i: i.get("at", 0), reverse=True)
+    kept, unpinned = [], 0
+    for i in items:
+        if i.get("type") == "image" and not os.path.isfile(i.get("path", "")):
+            continue
+        if not i.get("pinned"):
+            if i.get("at", 0) < cutoff or unpinned >= s["maxItems"]:
+                continue
+            unpinned += 1
+        kept.append(i)
+    referenced = {os.path.basename(i["path"]) for i in kept if i.get("type") == "image"}
+    try:
+        names = os.listdir(IMAGES)
+    except OSError:
+        names = []
+    for name in names:
+        p = os.path.join(IMAGES, name)
+        if name in referenced:
+            continue
+        # An image being captured right now sits under a temp name until it is
+        # added under the lock; leave fresh ones alone.
+        if name.startswith(TMP_PREFIX):
+            try:
+                if now - os.path.getmtime(p) < 600:
+                    continue
+            except OSError:
+                continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return kept
+
+
+def pruned_snapshot(s):
+    """Prune under the lock, writing only when something changed."""
+    with Locked():
+        items = load()
+        kept = prune(items, s)
+        if kept != items:
+            save(kept)
+    return kept
+
+
+# ---------------------------------------------------------------- capture
+
+def run(cmd, timeout=2):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def offered_types():
+    return set(run(["wl-paste", "--list-types"]).split())
+
+
+def active_window():
+    try:
+        w = json.loads(run(["hyprctl", "activewindow", "-j"], timeout=1) or "{}")
+        return w if isinstance(w, dict) else {}
+    except ValueError:
+        return {}
+
+
+def ignored_app(window, patterns):
+    names = [str(window.get(k) or "").lower() for k in ("class", "initialClass")]
+    return any(fnmatch.fnmatchcase(n, p.lower()) for n in names if n for p in patterns)
+
+
+def drain():
+    while sys.stdin.buffer.read(1 << 20):
+        pass
+
+
+def read_stdin(limit):
+    """Read at most `limit` bytes; drain the rest so the source app is not left
+    writing into a closed pipe. Returns (data, too_big)."""
+    data = sys.stdin.buffer.read(limit + 1)
+    if len(data) <= limit:
+        return data, False
+    drain()
+    return b"", True
+
+
+def image_info(raw):
+    """(mime, width, height) from the file's magic bytes, or (None, 0, 0)."""
+    try:
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", raw[16:24])
+            return "image/png", w, h
+        if raw[:6] in (b"GIF87a", b"GIF89a"):
+            w, h = struct.unpack("<HH", raw[6:10])
+            return "image/gif", w, h
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            chunk = raw[12:16]
+            if chunk == b"VP8X":
+                return "image/webp", 1 + int.from_bytes(raw[24:27], "little"), 1 + int.from_bytes(raw[27:30], "little")
+            if chunk == b"VP8L":
+                b = int.from_bytes(raw[21:25], "little")
+                return "image/webp", (b & 0x3FFF) + 1, ((b >> 14) & 0x3FFF) + 1
+            if chunk == b"VP8 ":
+                w, h = struct.unpack("<HH", raw[26:30])
+                return "image/webp", w & 0x3FFF, h & 0x3FFF
+            return "image/webp", 0, 0
+        if raw[:2] == b"BM":
+            w, h = struct.unpack("<ii", raw[18:26])
+            return "image/bmp", abs(w), abs(h)
+        if raw[:3] == b"\xff\xd8\xff":
+            i = 2
+            while i + 9 < len(raw):
+                if raw[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = raw[i + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7 or marker == 0xFF:
+                    i += 2 if marker != 0xFF else 1
+                    continue
+                seg = struct.unpack(">H", raw[i + 2:i + 4])[0]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h, w = struct.unpack(">HH", raw[i + 5:i + 9])
+                    return "image/jpeg", w, h
+                i += 2 + seg
+            return "image/jpeg", 0, 0
+    except struct.error:
+        pass
+    return None, 0, 0
+
+
+def capture(kind):
+    s = settings()
+    # wl-paste sets CLIPBOARD_STATE=sensitive when the source offers the
+    # password-manager hint; don't even read such data.
+    state = os.environ.get("CLIPBOARD_STATE", "")
+    if state in ("nil", "clear", "sensitive"):
+        return
+    is_image = kind == "image" or kind.startswith("image/")
+    if is_image and not s["images"]:
+        drain()
+        return
+    limit = (s["maxImageMB"] << 20) if is_image else (s["maxTextKB"] << 10)
+    raw, too_big = read_stdin(limit)
+    if too_big:
+        print(f"clip24: skipped a {kind} copy over the size limit", file=sys.stderr)
+        return
+    if not raw:
+        return
+
+    types = offered_types()
+    if types & SENSITIVE_TYPES:
+        return
+    window = active_window()
+    if ignored_app(window, s["ignoreApps"]):
+        return
+    app = str(window.get("class") or "")
+    now = time.time()
+
+    tmp = None
+    if not is_image:
+        # A copied image often comes with an HTML <img> fragment as its only
+        # text; the image watcher records the picture, so skip the markup.
+        if types and not (types & PLAIN_TEXT_TYPES) and any(t.startswith("image/") for t in types):
+            return
+        text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            return
+        entry = {"id": hashlib.sha1(text.encode()).hexdigest()[:16], "at": now, "type": "text", "text": text}
+    else:
+        # The watcher asks for the generic type "image", so the format comes
+        # from the data itself.
+        mime, w, h = image_info(raw)
+        if not mime:
+            return
+        digest = hashlib.sha256(raw).hexdigest()
+        ext = mime.split("/", 1)[1].replace("jpeg", "jpg")
+        entry = {"id": digest[:16], "at": now, "type": "image", "mime": mime,
+                 "path": os.path.join(IMAGES, f"{digest}.{ext}"), "size": len(raw), "width": w, "height": h}
+        ensure_dirs()
+        fd, tmp = create_temp(IMAGES, TMP_PREFIX)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+    if app:
+        entry["app"] = app
+
+    try:
+        with Locked():
+            items = load()
+            if items and items[0].get("id") == entry["id"]:
+                return  # already the newest entry (e.g. the watcher restarted)
+            old = next((i for i in items if i.get("id") == entry["id"]), None)
+            if old:
+                # A re-copy moves the entry to the top and keeps its pin and source app.
+                for key in ("pinned", "app"):
+                    if key in old:
+                        entry[key] = old[key]
+            if tmp:
+                if os.path.exists(entry["path"]):
+                    os.unlink(tmp)
+                else:
+                    os.replace(tmp, entry["path"])
+                tmp = None
+            items = [entry] + [i for i in items if i.get("id") != entry["id"]]
+            save(prune(items, s, now))
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------- reading
+
+def recording():
+    """Is a wl-paste watcher feeding this script running right now?"""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"wl-paste" and b"--watch" in argv \
+                and any(a.endswith(b"/clip24") for a in argv) and b"capture" in argv:
+            return True
+    return False
+
+
+URL = re.compile(r"^[a-z][a-z0-9+.-]*://\S+$", re.I)
+
+
+def panel_item(i):
+    out = {k: i[k] for k in ("id", "type", "at") if k in i}
+    out["pinned"] = bool(i.get("pinned"))
+    out["app"] = i.get("app", "")
+    if i.get("type") == "image":
+        out.update({k: i.get(k, 0) for k in ("width", "height", "size")})
+        out["path"] = i.get("path", "")
+        out["mime"] = i.get("mime", "image/png")
+        out["hay"] = f"image picture screenshot {out['mime']} {out['width']}x{out['height']} {out['app']}".lower()
+    else:
+        text = i.get("text", "")
+        body = text.strip("\n")
+        out["preview"] = body[:400].replace("\t", "    ")
+        out["lines"] = body.count("\n") + 1
+        out["chars"] = len(text)
+        out["url"] = bool(URL.match(text.strip()))
+        out["hay"] = (text[:4000] + " " + out["app"]).lower()
+    return out
+
+
+def panel(s):
+    items = pruned_snapshot(s)
+    pinned = [i for i in items if i.get("pinned")]
+    rest = [i for i in items if not i.get("pinned")]
+    return {
+        "items": [panel_item(i) for i in pinned + rest],
+        "total": len(items),
+        "pinned": len(pinned),
+        "recording": recording(),
+        "settings": {k: s[k] for k in ("retentionHours", "maxItems", "images")},
+        "config": CONF,
+        "db": DB,
+    }
+
+
+def find(eid):
+    return next((i for i in load() if i.get("id") == eid), None)
+
+
+# ---------------------------------------------------------------- actions
+
+def wl_copy(entry):
+    """wl-copy forks a server that keeps serving the data; give it no pipes of
+    ours, or whoever reads this script's output waits for that server."""
+    quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    try:
+        if entry["type"] == "text":
+            return subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"],
+                                  input=entry["text"].encode(), **quiet).returncode == 0
+        with open(entry["path"], "rb") as f:
+            return subprocess.run(["wl-copy", "--type", entry.get("mime", "image/png")], stdin=f, **quiet).returncode == 0
+    except OSError as e:
+        print(f"clip24: could not copy: {e}", file=sys.stderr)
+        return False
+
+
+def type_entry(entry):
+    if entry["type"] != "text":
+        wl_copy(entry)
+        notify("Copied the image instead", "Images can't be typed; paste it with Ctrl+V")
+        return True
+    time.sleep(0.45)  # let the panel close and focus return to the window
+    try:
+        r = subprocess.run(["wtype", "-"], input=entry["text"].encode(),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except OSError:
+        wl_copy(entry)
+        notify("wtype is not installed", "Copied instead; paste it with Ctrl+V")
+        return False
+
+
+def update(fn):
+    """Apply fn(items) -> items under the lock, prune, save."""
+    s = settings()
+    with Locked():
+        items = load()
+        before = json.dumps(items)  # fn may change entries in place
+        new = prune(fn(items), s)
+        if json.dumps(new) != before:
+            save(new)
+
+
+def set_pin(eid, mode):
+    hours = settings()["retentionHours"]
+
+    def change(items):
+        for i in items:
+            if i.get("id") == eid:
+                on = not i.get("pinned") if mode == "toggle" else mode == "on"
+                if on:
+                    i["pinned"] = True
+                elif i.pop("pinned", None):
+                    # Unpinning something older than the retention window would
+                    # delete it on the spot; give it a fresh window instead.
+                    now = time.time()
+                    if i.get("at", 0) < now - hours * 3600:
+                        i["at"] = now
+        return items
+    update(change)
+
+
+def edit():
+    if not os.path.exists(CONF):
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF, "w") as f:
+            json.dump(DEFAULTS, f, indent=2)
+            f.write("\n")
+    os.execvp("omarchy-launch-editor", ["omarchy-launch-editor", CONF])
+
+
+def main(a):
+    cmd, args = (a[0], a[1:]) if a else ("", [])
+    if cmd == "capture" and len(args) == 1:
+        capture(args[0])
+    elif cmd == "list" and not args:
+        print(json.dumps(pruned_snapshot(settings()), ensure_ascii=False))
+    elif cmd == "panel" and not args:
+        print(json.dumps(panel(settings()), ensure_ascii=False))
+    elif cmd in ("copy", "type") and len(args) == 1:
+        e = find(args[0])
+        if not e:
+            sys.exit(1)
+        ok = wl_copy(e) if cmd == "copy" else type_entry(e)
+        sys.exit(0 if ok else 1)
+    elif cmd == "pin" and len(args) in (1, 2) and (args[1:] or ["toggle"])[0] in ("on", "off", "toggle"):
+        set_pin(args[0], (args[1:] or ["toggle"])[0])
+    elif cmd == "delete" and len(args) == 1:
+        update(lambda items: [i for i in items if i.get("id") != args[0]])
+    elif cmd == "clear" and args in ([], ["--all"]):
+        update(lambda items: [] if args else [i for i in items if i.get("pinned")])
+    elif cmd == "prune" and not args:
+        update(lambda items: items)
+    elif cmd == "config" and not args:
+        print(json.dumps(dict(settings(), path=CONF), indent=2))
+    elif cmd == "edit" and not args:
+        edit()
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

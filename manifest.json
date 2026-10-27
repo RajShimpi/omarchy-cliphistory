@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "techspawn.cliphistory",
+  "name": "Clipboard History",
+  "version": "2.0.0",
+  "author": "Raj Shimpi",
+  "license": "MIT",
+  "description": "Remembers what you copy, text and images, for 24 hours (or as long as you like) and keeps it one click away in the bar: search it, copy it back, type it into any window, and pin what you want to keep. Password-manager copies are never stored, and nothing leaves your computer.",
+  "repository": "https://github.com/RajShimpi/omarchy-cliphistory",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": { "service": "Service.qml", "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Clipboard History",
+    "description": "Search, copy back, type and pin what you copied",
+    "category": "Productivity",
+    "aliases": ["clipboard", "clip", "history", "paste"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
